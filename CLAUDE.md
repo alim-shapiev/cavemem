@@ -86,7 +86,7 @@ Unit tests cover handlers, storage, and protocol contracts in isolation. They ca
 
 ## Release policy
 
-- Versioning via changesets. Releases are cut by GitHub Actions (`.github/workflows/release.yml`) on merge to `main` when a release changeset exists. Publishing from a laptop is not allowed.
+- Versioning via changesets. Releases are normally cut by GitHub Actions (`.github/workflows/release.yml`) on merge to `main` when a release changeset exists. Local publishing from a laptop is permitted as a fallback when CI publishing is unavailable (e.g. missing/expired `NPM_TOKEN`); use `pnpm --filter cavemem publish:release` from `main` after `npm login`.
 - Conventional Commits for commit messages. PRs require passing CI and one review.
 
 ## Authorship voice

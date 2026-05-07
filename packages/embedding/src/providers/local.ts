@@ -1,3 +1,4 @@
+import { detectMusl } from '../libc.js';
 import type { Embedder, EmbeddingFactoryOptions } from '../types.js';
 
 // Known model dimensions — lets callers build an Embedder without waiting for
@@ -23,6 +24,17 @@ export async function createLocalEmbedder(
   opts: EmbeddingFactoryOptions = {},
 ): Promise<Embedder> {
   const log = opts.log ?? (() => {});
+
+  // Guard against the musl segfault (issue #20). onnxruntime-node prebuilts
+  // target glibc; loading them on Alpine / musl-built Node aborts the
+  // process. Surface a clean, actionable error instead.
+  const muslProbe = detectMusl();
+  if (muslProbe.isMusl) {
+    throw new Error(
+      `Local embedding provider is not supported on musl libc (${muslProbe.reason ?? 'unknown'}). Set embedding.provider to 'none' or 'ollama' in ~/.cavemem/settings.json.`,
+    );
+  }
+
   log(`[cavemem:embed] loading local model ${model}`);
   const transformers = (await import('@xenova/transformers').catch((err) => {
     throw new Error(

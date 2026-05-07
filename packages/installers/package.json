@@ -19,7 +19,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cavemem/config": "workspace:*"
+    "@cavemem/config": "workspace:*",
+    "smol-toml": "^1.6.1"
   },
   "devDependencies": {
     "tsup": "^8.3.5",
