@@ -24,6 +24,16 @@ PACK="$WORK/pack"
 PREFIX="$WORK/prefix"
 HOME_DIR="$WORK/home"
 
+node_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+REPO_NODE="$(node_path "$REPO")"
+
 cleanup() {
   rm -rf "$PREFIX" "$HOME_DIR" "$PACK"
 }
@@ -44,7 +54,7 @@ echo "==> 2. stage publish files (README, LICENSE, hooks-scripts)"
 pnpm --filter cavemem stage-publish
 
 echo "==> 3. npm pack from apps/cli"
-VERSION=$(node -e "console.log(require('$REPO/apps/cli/package.json').version)")
+VERSION=$(REPO_NODE="$REPO_NODE" node -e "const path = require('node:path'); console.log(require(path.join(process.env.REPO_NODE, 'apps/cli/package.json')).version)")
 ( cd "$REPO/apps/cli" && npm pack --pack-destination "$PACK" >/dev/null )
 TGZ="$PACK/cavemem-$VERSION.tgz"
 test -f "$TGZ" || { echo "tarball missing at $TGZ"; ls "$PACK"; exit 1; }
@@ -54,14 +64,24 @@ tar -tzf "$TGZ" | sort
 
 echo "==> 5. install -g into isolated prefix"
 npm install --prefix "$PREFIX" --global "$TGZ" >/dev/null
-BIN="$PREFIX/bin/cavemem"
-test -x "$BIN" || { echo "bin shim missing"; exit 1; }
+if [ -x "$PREFIX/bin/cavemem" ]; then
+  BIN="$PREFIX/bin/cavemem"
+elif [ -x "$PREFIX/cavemem" ]; then
+  BIN="$PREFIX/cavemem"
+elif [ -f "$PREFIX/cavemem.cmd" ]; then
+  BIN="$PREFIX/cavemem.cmd"
+else
+  echo "bin shim missing"
+  exit 1
+fi
 
 # All subsequent commands run in an isolated $HOME so we never touch the real ~/.cavemem
 export HOME="$HOME_DIR"
+export USERPROFILE="$(node_path "$HOME_DIR")"
+export COPILOT_HOME="$(node_path "$HOME_DIR/.copilot")"
 
 echo "==> 6. version (must match apps/cli/package.json#version)"
-EXPECTED_VERSION=$(node -e "console.log(require('$REPO/apps/cli/package.json').version)")
+EXPECTED_VERSION=$(REPO_NODE="$REPO_NODE" node -e "const path = require('node:path'); console.log(require(path.join(process.env.REPO_NODE, 'apps/cli/package.json')).version)")
 ACTUAL_VERSION=$("$BIN" --version)
 test "$ACTUAL_VERSION" = "$EXPECTED_VERSION" || {
   echo "version mismatch: bin reports '$ACTUAL_VERSION', package.json says '$EXPECTED_VERSION'"
@@ -75,6 +95,15 @@ echo "==> 7. install --ide claude-code"
 echo "==> 8. claude settings written"
 test -f "$HOME/.claude/settings.json"
 grep -q "hook run session-start --ide claude-code" "$HOME/.claude/settings.json"
+
+echo "==> 8b. install --ide copilot-cli"
+"$BIN" install --ide copilot-cli
+
+echo "==> 8c. copilot cli config written"
+test -f "$HOME/.copilot/hooks/cavemem.json"
+test -f "$HOME/.copilot/mcp-config.json"
+grep -q "hook run session-start --ide copilot-cli" "$HOME/.copilot/hooks/cavemem.json"
+grep -q '"cavemem"' "$HOME/.copilot/mcp-config.json"
 
 echo "==> 9. drive full hook lifecycle"
 echo '{"session_id":"e2e","hook_event_name":"SessionStart","source":"startup","cwd":"/tmp"}' | "$BIN" hook run session-start --ide claude-code
@@ -91,8 +120,17 @@ out=$(echo '{"session_id":"e2e-2","hook_event_name":"SessionStart","source":"sta
 echo "$out" | grep -q '"hookSpecificOutput"' || { echo "missing hookSpecificOutput"; exit 1; }
 echo "$out" | grep -q '"additionalContext"' || { echo "missing additionalContext"; exit 1; }
 
+echo "==> 11b. copilot cli emits direct additionalContext JSON"
+out=$(echo '{"session_id":"e2e-copilot","hook_event_name":"SessionStart","source":"startup"}' | "$BIN" hook run session-start --ide copilot-cli 2>/dev/null)
+echo "$out" | grep -q '"additionalContext"' || { echo "missing copilot additionalContext"; exit 1; }
+! echo "$out" | grep -q '"hookSpecificOutput"' || { echo "copilot output used Claude envelope"; exit 1; }
+
+echo "==> 11c. copilot cli PostToolUse payload maps tool_result text"
+echo '{"session_id":"e2e-copilot","hook_event_name":"PostToolUse","tool_name":"bash","tool_input":{"command":"printf copilot-output-marker"},"tool_result":{"result_type":"success","text_result_for_llm":"copilot-output-marker"}}' | "$BIN" hook run post-tool-use --ide copilot-cli
+
 echo "==> 12. search via FTS (better-sqlite3 native)"
 "$BIN" search "hosts" | grep -q "hosts" || { echo "FTS search returned no hits"; exit 1; }
+"$BIN" search "copilot-output-marker" | grep -q "copilot-output-marker" || { echo "copilot PostToolUse was not indexed"; exit 1; }
 
 echo "==> 13. doctor reports healthy"
 "$BIN" doctor
@@ -124,6 +162,9 @@ wait $mcp_pid 2>/dev/null || true
 echo "==> 15. uninstall cleans up settings"
 "$BIN" uninstall --ide claude-code
 grep -q "cavemem" "$HOME/.claude/settings.json" && { echo "uninstall left cavemem entry"; exit 1; }
+"$BIN" uninstall --ide copilot-cli
+grep -q "cavemem" "$HOME/.copilot/hooks/cavemem.json" && { echo "copilot uninstall left hook entry"; exit 1; }
+grep -q '"cavemem"' "$HOME/.copilot/mcp-config.json" && { echo "copilot uninstall left mcp entry"; exit 1; }
 
 echo
 echo "ALL CHECKS PASSED"

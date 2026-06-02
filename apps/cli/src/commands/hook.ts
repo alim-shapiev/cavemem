@@ -1,5 +1,6 @@
 import { type HookName, type HookResult, runHook } from '@cavemem/hooks';
 import type { Command } from 'commander';
+import { adaptHookInputForIde, formatIdeOutput } from './hook-protocol.js';
 
 const VALID: HookName[] = [
   'session-start',
@@ -8,16 +9,6 @@ const VALID: HookName[] = [
   'stop',
   'session-end',
 ];
-
-// Claude Code event names — used in hookSpecificOutput.hookEventName when we
-// emit additionalContext back to the agent.
-const CLAUDE_EVENT_NAME: Record<HookName, string> = {
-  'session-start': 'SessionStart',
-  'user-prompt-submit': 'UserPromptSubmit',
-  'post-tool-use': 'PostToolUse',
-  stop: 'Stop',
-  'session-end': 'SessionEnd',
-};
 
 export function registerHookCommand(program: Command): void {
   const hook = program.command('hook').description('Internal: hook handler entrypoints');
@@ -35,9 +26,10 @@ export function registerHookCommand(program: Command): void {
       const hookName = name as HookName;
       const raw = await readStdin();
       const parsed = raw.trim() ? safeJson(raw) : {};
+      const adapted = adaptHookInputForIde(parsed, opts.ide);
       const input = {
-        session_id: typeof parsed.session_id === 'string' ? parsed.session_id : 'unknown',
-        ...parsed,
+        session_id: typeof adapted.session_id === 'string' ? adapted.session_id : 'unknown',
+        ...adapted,
         ...(opts.ide ? { ide: opts.ide } : {}),
       } as Parameters<typeof runHook>[1];
 
@@ -55,23 +47,13 @@ export function registerHookCommand(program: Command): void {
         return;
       }
 
-      writeIdeOutput(hookName, result);
+      writeIdeOutput(hookName, result, opts.ide);
     });
 }
 
-function writeIdeOutput(hook: HookName, result: HookResult): void {
-  // Only SessionStart and UserPromptSubmit can usefully feed text back into
-  // the agent. For other hooks we deliberately stay silent on stdout.
-  if (hook !== 'session-start' && hook !== 'user-prompt-submit') return;
-  const ctx = result.context?.trim();
-  if (!ctx) return;
-  const payload = {
-    hookSpecificOutput: {
-      hookEventName: CLAUDE_EVENT_NAME[hook],
-      additionalContext: ctx,
-    },
-  };
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+function writeIdeOutput(hook: HookName, result: HookResult, ide?: string): void {
+  const payload = formatIdeOutput(hook, result, ide);
+  if (payload) process.stdout.write(`${payload}\n`);
 }
 
 function safeJson(s: string): Record<string, unknown> {

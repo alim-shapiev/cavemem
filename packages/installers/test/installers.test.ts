@@ -13,6 +13,7 @@ import { parse as parseToml } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { claudeCode } from '../src/claude-code.js';
 import { codex } from '../src/codex.js';
+import { copilotCli } from '../src/copilot-cli.js';
 import { cursor } from '../src/cursor.js';
 import { deepMerge } from '../src/fs-utils.js';
 import { openCode } from '../src/opencode.js';
@@ -52,7 +53,7 @@ afterEach(() => {
 describe('registry', () => {
   it('exposes all expected installers', () => {
     expect(Object.keys(installers).sort()).toEqual(
-      ['claude-code', 'codex', 'cursor', 'gemini-cli', 'opencode'].sort(),
+      ['claude-code', 'codex', 'copilot-cli', 'cursor', 'gemini-cli', 'opencode'].sort(),
     );
   });
   it('getInstaller throws on unknown id', () => {
@@ -508,5 +509,205 @@ describe('cursor installer', () => {
     await cursor.uninstall(ctx);
     const after = JSON.parse(readFileSync(p, 'utf8')) as typeof cfg;
     expect(after.mcpServers.cavemem).toBeUndefined();
+  });
+});
+
+describe('copilot-cli installer', () => {
+  let originalCopilotHome: string | undefined;
+
+  beforeEach(() => {
+    originalCopilotHome = process.env.COPILOT_HOME;
+    delete process.env.COPILOT_HOME;
+  });
+
+  afterEach(() => {
+    if (originalCopilotHome === undefined) delete process.env.COPILOT_HOME;
+    else process.env.COPILOT_HOME = originalCopilotHome;
+  });
+
+  const hooksPath = () => join(home, '.copilot', 'hooks', 'cavemem.json');
+  const mcpPath = () => join(home, '.copilot', 'mcp-config.json');
+
+  it('writes Copilot hooks and MCP config', async () => {
+    await copilotCli.install(ctx);
+    expect(existsSync(hooksPath())).toBe(true);
+    expect(existsSync(mcpPath())).toBe(true);
+
+    const hooks = JSON.parse(readFileSync(hooksPath(), 'utf8')) as {
+      version: number;
+      hooks: Record<
+        string,
+        Array<{ type: string; bash: string; powershell: string; timeoutSec: number }>
+      >;
+    };
+    expect(hooks.version).toBe(1);
+    expect(Object.keys(hooks.hooks).sort()).toEqual(
+      ['PostToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit'].sort(),
+    );
+    expect(hooks.hooks.SessionStart?.[0]).toEqual({
+      type: 'command',
+      bash: `'${ctx.nodeBin}' '${ctx.cliPath}' hook run session-start --ide copilot-cli`,
+      powershell: `& '${ctx.nodeBin}' '${ctx.cliPath}' hook run session-start --ide copilot-cli`,
+      timeoutSec: 10,
+    });
+    expect(hooks.hooks.PostToolUse?.[0]?.timeoutSec).toBe(5);
+
+    const mcp = JSON.parse(readFileSync(mcpPath(), 'utf8')) as {
+      mcpServers: Record<
+        string,
+        { type: string; command: string; args: string[]; tools: string[] }
+      >;
+    };
+    expect(mcp.mcpServers.cavemem).toEqual({
+      type: 'stdio',
+      command: ctx.nodeBin,
+      args: [ctx.cliPath, 'mcp'],
+      tools: ['*'],
+    });
+  });
+
+  it('is idempotent', async () => {
+    await copilotCli.install(ctx);
+    await copilotCli.install(ctx);
+
+    const hooks = JSON.parse(readFileSync(hooksPath(), 'utf8')) as {
+      hooks: Record<string, Array<unknown>>;
+    };
+    for (const name of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd']) {
+      expect(hooks.hooks[name]?.length).toBe(1);
+    }
+
+    const mcp = JSON.parse(readFileSync(mcpPath(), 'utf8')) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(Object.keys(mcp.mcpServers)).toEqual(['cavemem']);
+  });
+
+  it('replaces only the cavemem MCP server entry', async () => {
+    mkdirSync(join(home, '.copilot'), { recursive: true });
+    writeFileSync(
+      mcpPath(),
+      JSON.stringify({
+        mcpServers: {
+          other: { type: 'http', url: 'https://example.test/mcp' },
+          cavemem: { type: 'http', url: 'https://stale.example.test/mcp', env: { OLD: '1' } },
+        },
+      }),
+    );
+
+    await copilotCli.install(ctx);
+
+    const mcp = JSON.parse(readFileSync(mcpPath(), 'utf8')) as {
+      mcpServers: Record<string, unknown>;
+    };
+    expect(mcp.mcpServers.other).toEqual({ type: 'http', url: 'https://example.test/mcp' });
+    expect(mcp.mcpServers.cavemem).toEqual({
+      type: 'stdio',
+      command: ctx.nodeBin,
+      args: [ctx.cliPath, 'mcp'],
+      tools: ['*'],
+    });
+  });
+
+  it('preserves unrelated config and uninstall removes only cavemem entries', async () => {
+    mkdirSync(join(home, '.copilot', 'hooks'), { recursive: true });
+    writeFileSync(
+      hooksPath(),
+      JSON.stringify({
+        version: 1,
+        disableAllHooks: false,
+        hooks: {
+          SessionStart: [{ type: 'command', command: 'echo other start', timeoutSec: 3 }],
+          PreToolUse: [{ type: 'command', command: 'echo pre tool' }],
+        },
+      }),
+    );
+    mkdirSync(join(home, '.copilot'), { recursive: true });
+    writeFileSync(
+      mcpPath(),
+      JSON.stringify({
+        custom: true,
+        mcpServers: {
+          other: { type: 'stdio', command: '/other/bin', args: [] },
+        },
+      }),
+    );
+
+    await copilotCli.install(ctx);
+    await copilotCli.uninstall(ctx);
+
+    const hooks = JSON.parse(readFileSync(hooksPath(), 'utf8')) as {
+      disableAllHooks: boolean;
+      hooks: Record<string, Array<{ command: string }>>;
+    };
+    expect(hooks.disableAllHooks).toBe(false);
+    expect(hooks.hooks.SessionStart).toEqual([
+      { type: 'command', command: 'echo other start', timeoutSec: 3 },
+    ]);
+    expect(hooks.hooks.PreToolUse).toEqual([{ type: 'command', command: 'echo pre tool' }]);
+    expect(hooks.hooks.PostToolUse).toBeUndefined();
+
+    const mcp = JSON.parse(readFileSync(mcpPath(), 'utf8')) as {
+      custom: boolean;
+      mcpServers: Record<string, unknown>;
+    };
+    expect(mcp.custom).toBe(true);
+    expect(mcp.mcpServers.other).toEqual({ type: 'stdio', command: '/other/bin', args: [] });
+    expect(mcp.mcpServers.cavemem).toBeUndefined();
+  });
+
+  it('quotes Windows paths in hook command strings and stores raw MCP args', async () => {
+    const winCtx: InstallContext = {
+      ideConfigDir: home,
+      cliPath: 'C:\\Users\\Some User\\AppData\\Roaming\\npm\\node_modules\\cavemem\\dist\\index.js',
+      nodeBin: 'C:\\Program Files\\nodejs\\node.exe',
+      dataDir: join(home, '.cavemem'),
+    };
+    await copilotCli.install(winCtx);
+
+    const hooks = JSON.parse(readFileSync(hooksPath(), 'utf8')) as {
+      hooks: Record<string, Array<{ bash: string; powershell: string }>>;
+    };
+    expect(hooks.hooks.SessionStart?.[0]?.bash).toBe(
+      `'${winCtx.nodeBin}' '${winCtx.cliPath}' hook run session-start --ide copilot-cli`,
+    );
+    expect(hooks.hooks.SessionStart?.[0]?.powershell).toBe(
+      `& '${winCtx.nodeBin}' '${winCtx.cliPath}' hook run session-start --ide copilot-cli`,
+    );
+
+    const mcp = JSON.parse(readFileSync(mcpPath(), 'utf8')) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    const cavemem = mcp.mcpServers.cavemem;
+    expect(cavemem).toEqual({
+      type: 'stdio',
+      command: winCtx.nodeBin,
+      args: [winCtx.cliPath, 'mcp'],
+      tools: ['*'],
+    });
+  });
+
+  it('respects COPILOT_HOME', async () => {
+    const copilotHome = join(home, '.custom-copilot');
+    process.env.COPILOT_HOME = copilotHome;
+
+    await copilotCli.install(ctx);
+
+    expect(existsSync(join(copilotHome, 'hooks', 'cavemem.json'))).toBe(true);
+    expect(existsSync(join(copilotHome, 'mcp-config.json'))).toBe(true);
+    expect(existsSync(hooksPath())).toBe(false);
+    expect(existsSync(mcpPath())).toBe(false);
+  });
+
+  it('detect returns true only when Copilot home exists', async () => {
+    expect(await copilotCli.detect(ctx)).toBe(false);
+    mkdirSync(join(home, '.copilot'));
+    expect(await copilotCli.detect(ctx)).toBe(true);
+
+    const copilotHome = join(home, '.custom-copilot');
+    process.env.COPILOT_HOME = copilotHome;
+    expect(await copilotCli.detect(ctx)).toBe(false);
+    mkdirSync(copilotHome);
+    expect(await copilotCli.detect(ctx)).toBe(true);
   });
 });
